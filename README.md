@@ -1,4 +1,4 @@
-# omatouch
+# omatouch — Touchscreen Tools
 
 A touchscreen plugin for the Omarchy shell: enable or disable the panel, bind
 it to the right monitor, correct its rotation, and see every contact drawn

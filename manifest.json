@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "prezziej.touchscreen",
-  "name": "Touchscreen",
+  "name": "Touchscreen Tools",
   "version": "0.1.0",
   "author": "prezziej",
   "license": "MIT",
@@ -15,7 +15,7 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "Touchscreen",
+    "displayName": "Touchscreen Tools",
     "description": "Enable, orient and visualise a touchscreen.",
     "category": "System",
     "allowMultiple": false,

@@ -213,42 +213,66 @@ Panel {
           // Omarchy update would take any fix to it back, so the header lives
           // here instead. Same typography, aligned to the same left edge as
           // the rest of the panel.
-          ColumnLayout {
+          RowLayout {
             Layout.fillWidth: true
-            spacing: Style.space(2)
+            spacing: Style.space(14)
 
-            Text {
+            ColumnLayout {
               Layout.fillWidth: true
-              textFormat: Text.PlainText
-              visible: text !== ""
-              text: heroFacts.title
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.title
-              font.bold: true
-              elide: Text.ElideRight
+              Layout.alignment: Qt.AlignVCenter
+              spacing: Style.space(2)
+
+              Text {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                visible: text !== ""
+                text: heroFacts.title
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+                font.bold: true
+                elide: Text.ElideRight
+              }
+
+              Text {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                visible: text !== ""
+                text: heroFacts.meta.toUpperCase()
+                color: Qt.darker(root.foreground, 1.4)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.2
+                wrapMode: Text.WordWrap
+                maximumLineCount: 2
+                elide: Text.ElideRight
+              }
             }
 
-            Text {
-              Layout.fillWidth: true
-              textFormat: Text.PlainText
-              visible: text !== ""
-              text: heroFacts.meta.toUpperCase()
-              color: Qt.darker(root.foreground, 1.4)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              font.letterSpacing: 1.2
-              elide: Text.ElideRight
+            // Big, and on the right. Width comes from the artwork's own aspect
+            // rather than a guess, so the glyph is never squashed whatever
+            // height the panel gives it.
+            Touchscreen {
+              id: heroGlyph
+              Layout.alignment: Qt.AlignVCenter | Qt.AlignRight
+              Layout.preferredHeight: Style.space(72)
+              Layout.preferredWidth: Math.round(Layout.preferredHeight * heroGlyph.aspect)
+              tint: root.foreground
+              // Dimmed when there is nothing to drive. The panel still needs a
+              // header, but a full-strength icon would claim a touchscreen the
+              // plugin cannot actually see.
+              opacity: root.present ? 0.92 : 0.3
             }
           }
 
           QtObject {
             id: heroFacts
-            property string title: {
-              if (root.svcDenied) return "Touchscreen unreadable"
-              return root.present ? (root.svcModel || "Touchscreen") : "No touchscreen"
-            }
+            // The app's name, not the device's. The panel is a set of tools;
+            // which digitizer they are pointed at is a fact ABOUT the machine
+            // and belongs on the line below, where the contact count already
+            // lives.
+            property string title: "Touchscreen Tools"
             property string meta: {
               // THE PERMISSIONS CASE GETS THE FIX, NOT A DIAGNOSIS. "Permission
               // denied" is true and useless; the two things someone has to do
@@ -257,6 +281,9 @@ Panel {
                 return "Add yourself to the 'input' group and log back in:  sudo usermod -aG input $USER"
               if (!root.present) return "No direct-touch device found in /dev/input"
               var parts = []
+              // The model first: it is the answer to "which panel is this
+              // driving", which used to be the headline and must not be lost.
+              if (root.svcModel) parts.push(root.svcModel)
               if (root.svcSlots > 0) parts.push(root.svcSlots + " simultaneous contacts")
               if (root.svcSemiMt) parts.push("semi-MT (bounding box only)")
               if (!root.val("enabled", true)) parts.push("switched off")

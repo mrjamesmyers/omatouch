@@ -49,7 +49,7 @@ install_changed() { # src dst
   cp -f "$1" "$2"
 }
 
-for f in manifest.json Service.qml Overlay.qml Hud.qml BarWidget.qml Panel.qml; do
+for f in manifest.json Service.qml Overlay.qml Hud.qml BarWidget.qml Panel.qml Touchscreen.qml; do
   install_changed "$ROOT/$f" "$PLUGIN_DIR/$f"
 done
 

@@ -687,11 +687,12 @@ else
     "$QMLFORMAT" -n "$f" >/dev/null 2>&1 || qml_bad="$qml_bad $(basename "$f")"
   done
   # The count, because a glob over nothing loops zero times and reports success.
-  # Five is the manifest's two entry points plus Overlay, Hud and Panel; a sixth
-  # would be a new file nobody added to install.sh's explicit list.
-  check "there are five QML files to parse" 5 "$qml_n"
+  # Six is the manifest's two entry points plus Overlay, Hud, Panel and the
+  # Touchscreen glyph; a seventh would be a new file nobody added to
+  # install.sh's explicit list.
+  check "there are six QML files to parse" 6 "$qml_n"
   if [[ -z "$qml_bad" ]]; then
-    ok "all five QML files parse ($(basename "$QMLFORMAT") -n)"
+    ok "all six QML files parse ($(basename "$QMLFORMAT") -n)"
   else
     bad "QML files fail to parse:$qml_bad"
   fi
@@ -1034,11 +1035,11 @@ PDIR="$FAKE/.config/omarchy/plugins/prezziej.touchscreen"
 # LC_ALL=C: the default collation ignores the '/' and interleaves scripts/* with
 # the top-level files, which makes the expected list unreadable.
 got_files="$(cd "$PDIR" 2>/dev/null && find . -type f -printf '%P\n' | LC_ALL=C sort | tr '\n' ' ')"
-want_files="BarWidget.qml Hud.qml Overlay.qml Panel.qml Service.qml manifest.json scripts/clamshell scripts/doctor scripts/orientation scripts/touch-tap "
+want_files="BarWidget.qml Hud.qml Overlay.qml Panel.qml Service.qml Touchscreen.qml manifest.json scripts/clamshell scripts/doctor scripts/orientation scripts/touch-tap "
 # An explicit list, not a glob: the shell compiles every .qml it finds in the
 # plugin dir, so a lab or scratch file swept in would be compiled by the shell,
 # and fixtures have no business shipping at all.
-check "install.sh ships exactly the six plugin files and four scripts" "$want_files" "$got_files"
+check "install.sh ships exactly the seven plugin files and four scripts" "$want_files" "$got_files"
 
 modes="$(stat -c '%a' "$PDIR"/scripts/* 2>/dev/null | sort -u | tr '\n' ' ')"
 check "the installed scripts are mode 755" "755 " "$modes"
