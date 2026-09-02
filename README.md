@@ -4,7 +4,7 @@ A touchscreen plugin for the Omarchy shell: enable or disable the panel, bind
 it to the right monitor, correct its rotation, and see every contact drawn
 where your finger actually is.
 
-Companion to [omatrackpad](../omatrackpad). The two deliberately do not overlap
+Companion to `omatrackpad`. The two deliberately do not overlap
 — `trackpad-tap` rejects `INPUT_PROP_DIRECT` devices and `touch-tap` requires
 them, so exactly one of them claims any given surface.
 
@@ -69,6 +69,31 @@ how they survive a reboot and win over the defaults without editing a single
 file you own. `hyprctl keyword` is not used, because Omarchy drives Hyprland
 from Lua and the compositor refuses: *"keyword can't work with non-legacy
 parsers."*
+
+## Tablet mode and clamshell
+
+This laptop folds into a tablet, and lives on a stand in a car. Two settings
+follow from that, and both reach outside the plugin's usual territory.
+
+**Tablet mode** locks the keyboard and trackpad when the screen is folded back,
+so a hand on the underside does not type. Orientation follows the
+accelerometer — with a two-sample settle, because the first reading after a
+wake is reliably a bogus `[0, 0, 1000]` and acting on it rotates the screen for
+no reason.
+
+**Clamshell mode** keeps the machine running with the lid shut. That is
+systemd-logind policy in `/etc` rather than anything in your Hyprland config,
+so `scripts/clamshell` reads the effective value over D-Bus (no root needed,
+so the panel can always show the truth) and changes it through pkexec.
+
+It uses `systemctl reload`, never `restart`. Restarting `systemd-logind` tears
+down the login session it owns — the compositor and everything in it goes with
+it. That was learned the hard way on this machine: a restart to apply this very
+setting took the desktop down and back up.
+
+The trade is real and stated in the tool: a closed lid no longer sleeps the
+machine, so it will flatten the battery if closed and left in a bag. Right for
+a car computer, wrong for a laptop you carry.
 
 ## The reader
 
