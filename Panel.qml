@@ -203,13 +203,53 @@ Panel {
           width: parent.width
           spacing: Style.space(12)
 
-          PanelHero {
+          // NOT PanelHero, and the reason is a 14px gap.
+          //
+          // PanelHero anchors its labels to `iconLoader.right` plus
+          // Style.space(14). With no iconComponent that loader is zero-width
+          // at the left edge, so the margin survives as a pure indent -- the
+          // title and the contacts line sat 14px right of the tab buttons and
+          // every section below them. The shell owns that component and an
+          // Omarchy update would take any fix to it back, so the header lives
+          // here instead. Same typography, aligned to the same left edge as
+          // the rest of the panel.
+          ColumnLayout {
             Layout.fillWidth: true
-            title: {
+            spacing: Style.space(2)
+
+            Text {
+              Layout.fillWidth: true
+              textFormat: Text.PlainText
+              visible: text !== ""
+              text: heroFacts.title
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+              elide: Text.ElideRight
+            }
+
+            Text {
+              Layout.fillWidth: true
+              textFormat: Text.PlainText
+              visible: text !== ""
+              text: heroFacts.meta.toUpperCase()
+              color: Qt.darker(root.foreground, 1.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 1.2
+              elide: Text.ElideRight
+            }
+          }
+
+          QtObject {
+            id: heroFacts
+            property string title: {
               if (root.svcDenied) return "Touchscreen unreadable"
               return root.present ? (root.svcModel || "Touchscreen") : "No touchscreen"
             }
-            meta: {
+            property string meta: {
               // THE PERMISSIONS CASE GETS THE FIX, NOT A DIAGNOSIS. "Permission
               // denied" is true and useless; the two things someone has to do
               // are a group and a re-login, so say both.
@@ -223,8 +263,6 @@ Panel {
               else if (root.svcLidClosed) parts.push("lid shut")
               return parts.join("  ·  ")
             }
-            foreground: root.foreground
-            fontFamily: root.fontFamily
           }
 
           ButtonGroup {
