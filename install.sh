@@ -53,8 +53,18 @@ for f in manifest.json Service.qml Overlay.qml Hud.qml BarWidget.qml Panel.qml; 
   install_changed "$ROOT/$f" "$PLUGIN_DIR/$f"
 done
 
+# Same rule for the scripts, and for the same reason. `install` copies
+# unconditionally, so this loop used to rewrite all three on a no-op re-run --
+# three more changed files, three more rolls of the dice above. The -x test is
+# what `install -m 755` was really here for: a script that lands
+# non-executable never runs, and identical content does not fix its mode.
+install_changed_exec() { # src dst
+  cmp -s "$1" "$2" 2>/dev/null && [[ -x "$2" ]] && return 0
+  install -m 755 "$1" "$2"
+}
+
 for f in touch-tap orientation clamshell; do
-  install -m 755 "$ROOT/scripts/$f" "$PLUGIN_DIR/scripts/$f"
+  install_changed_exec "$ROOT/scripts/$f" "$PLUGIN_DIR/scripts/$f"
 done
 
 say "plugin installed to $PLUGIN_DIR"
