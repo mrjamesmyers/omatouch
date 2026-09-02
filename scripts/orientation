@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Report screen orientation from the accelerometer.
+
+WHY THIS EXISTS. This Yoga folds into a tablet but does NOT report
+SW_TABLET_MODE -- checked: its only switch bit is SW_LID. So the kernel never
+says "I am folded", and neither libinput nor Hyprland can know. What the
+machine does have is an IIO accelerometer (accel_3d), and gravity is enough to
+say which way up the screen is.
+
+That distinction matters and is not hedging: orientation is a MEASUREMENT,
+posture is an INFERENCE. Which edge is down can be read off the sensor
+directly. Whether the keyboard is folded behind the screen cannot -- a laptop
+lying flat on a desk and a tablet lying flat on a desk produce identical
+readings. So this reports orientation as fact and posture as a guess with its
+own confidence, and the plugin is wired so that rotation follows the fact while
+disabling the keyboard follows a deliberate choice.
+
+Output (one JSON object, or a stream with --watch):
+
+    {"orientation":"normal","transform":0,"confidence":0.98,
+     "flat":false,"g":[0.11,-9.41,-3.36]}
+
+`transform` is Hyprland's rotation enum, so a consumer can pass it straight to
+hl.monitor / hl.device without a second table.
+"""
+
+import argparse
+import glob
+import json
+import math
+import os
+import sys
+import time
+
+SYSFS_IIO = "/sys/bus/iio/devices"
+
+# Hyprland transform enum.
+TRANSFORM = {"normal": 0, "90": 1, "180": 2, "270": 3}
+
+# Below this fraction of g on the screen plane, the device is lying flat and
+# the horizontal axes are noise. Reporting an orientation from noise is how
+# auto-rotate ends up flipping the screen while it sits on a table.
+FLAT_THRESHOLD = 0.35
+
+
+def find_accel():
+    for path in sorted(glob.glob(os.path.join(SYSFS_IIO, "iio:device*"))):
+        try:
+            with open(os.path.join(path, "name")) as fh:
+                if fh.read().strip() == "accel_3d":
+                    return path
+        except OSError:
+            continue
+    return None
+
+
+def read_scale(path):
+    try:
+        with open(os.path.join(path, "in_accel_scale")) as fh:
+            return float(fh.read().strip())
+    except (OSError, ValueError):
+        return 1.0
+
+
+def read_axes(path, scale):
+    out = []
+    for axis in ("x", "y", "z"):
+        try:
+            with open(os.path.join(path, f"in_accel_{axis}_raw")) as fh:
+                out.append(float(fh.read().strip()) * scale)
+        except (OSError, ValueError):
+            return None
+    return out
+
+
+def classify(g):
+    """(orientation, confidence, flat) from a gravity vector in m/s^2.
+
+    Only x and y matter: they lie in the plane of the screen. z is the axis
+    out of the screen, and it is what tells us the thing is lying flat rather
+    than which way up it is.
+    """
+    x, y, z = g
+    planar = math.hypot(x, y)
+    magnitude = math.sqrt(x * x + y * y + z * z) or 1.0
+
+    if planar / magnitude < FLAT_THRESHOLD:
+        # Face up or face down. No meaningful rotation to report.
+        return "flat", 0.0, True
+
+    # Screen-plane angle. The panel's mounting decides the sign convention, and
+    # this one is the common Lenovo layout: y negative when upright.
+    if abs(y) >= abs(x):
+        orientation = "normal" if y < 0 else "180"
+    else:
+        orientation = "270" if x < 0 else "90"
+
+    # How decisively one axis dominates. A device held at 45 degrees gives ~0.5
+    # and should not trigger a rotation; one held square gives ~1.0.
+    dominant = max(abs(x), abs(y))
+    confidence = min(1.0, (dominant / planar) if planar else 0.0)
+    return orientation, round(confidence, 3), False
+
+
+def sample(path, scale):
+    g = read_axes(path, scale)
+    if g is None:
+        return {"error": "could not read accelerometer axes"}
+    orientation, confidence, flat = classify(g)
+    return {
+        "orientation": orientation,
+        "transform": TRANSFORM.get(orientation, 0),
+        "confidence": confidence,
+        "flat": flat,
+        "g": [round(v, 3) for v in g],
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="orientation",
+                                 description="Screen orientation from the accelerometer.")
+    ap.add_argument("--watch", action="store_true",
+                    help="stream one line per change instead of exiting")
+    ap.add_argument("--interval", type=float, default=1.0,
+                    help="seconds between samples in --watch mode")
+    ap.add_argument("--min-confidence", type=float, default=0.82,
+                    help="below this, a reading is reported but marked unsure")
+    ap.add_argument("--settle", type=int, default=2,
+                    help="consecutive agreeing samples required before emitting "
+                         "a change (guards the sensor's bogus first read)")
+    args = ap.parse_args()
+
+    path = find_accel()
+    if not path:
+        print(json.dumps({"error": "no accel_3d device in " + SYSFS_IIO}))
+        return 2
+    scale = read_scale(path)
+
+    if not args.watch:
+        # Discard a first read that matches the idle artifact exactly. Cheap,
+        # and the alternative is reporting "flat" to a caller that asked once.
+        s = sample(path, scale)
+        if s.get("g") == [0.0, 0.0, round(scale * 1000, 3)]:
+            time.sleep(0.25)
+            s = sample(path, scale)
+        s["sure"] = (not s.get("flat")) and s.get("confidence", 0) >= args.min_confidence
+        print(json.dumps(s))
+        return 0
+
+    last = None
+    pending = None
+    agree = 0
+
+    try:
+        while True:
+            s = sample(path, scale)
+            s["sure"] = (not s.get("flat")) and s.get("confidence", 0) >= args.min_confidence
+            key = (s.get("orientation"), s.get("sure"))
+
+            # TWO CONSECUTIVE AGREEING SAMPLES BEFORE ANYTHING IS EMITTED.
+            #
+            # Two separate reasons, both observed on this machine:
+            #
+            # 1. The first read after the sensor has been idle returns exactly
+            #    [0, 0, 1000] -- a clean 1g on Z, physically plausible and
+            #    completely wrong. One sample later it reads the truth. Emitting
+            #    that artifact would rotate the screen at every start.
+            #
+            # 2. Rotation should not follow a momentary tilt. Picking the
+            #    machine up, or knocking the desk, briefly swings gravity
+            #    across an axis boundary; a consumer acting on one sample would
+            #    flip the display and flip it back.
+            #
+            # Debouncing here rather than in the consumer keeps every consumer
+            # honest, and costs one interval of latency on a real rotation.
+            if key == pending:
+                agree += 1
+            else:
+                pending = key
+                agree = 1
+
+            if agree >= args.settle and key != last:
+                last = key
+                print(json.dumps(s), flush=True)
+
+            time.sleep(max(0.2, args.interval))
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,740 @@
+#!/usr/bin/env python3
+"""Stream touchSCREEN contact positions as JSON lines.
+
+THE INVERSE OF trackpad-tap. That script classifies a surface and rejects
+INPUT_PROP_DIRECT with the comment "a touchscreen has fingers and axes and is
+emphatically not a trackpad". This one keeps exactly what that one throws away:
+a direct-touch digitizer, where the contact coordinate IS a screen coordinate.
+
+That difference is not cosmetic, and it changes what the consumer should draw.
+A trackpad HUD has to draw a scale model of the pad, because the pad is not the
+screen and the finger is somewhere you cannot see. A touchscreen HUD must NOT:
+the finger is already on the pixel it is pointing at, so a scale model would be
+a picture of the screen, drawn on that screen, underneath the hand it depicts.
+So x and y here are normalised 0..1 in DISPLAY space and a consumer is expected
+to draw at that point, full-screen, not inside a plate.
+
+Output is deliberately identical in shape to trackpad-tap, so a consumer can
+read either without a second parser:
+
+    {"n":2,"click":false,"f":[{"x":0.41,"y":0.62,"p":0.31,"id":7}, ...]}
+
+Nothing is printed while no contact is down. The single {"n":0} frame when the
+last finger lifts is what tells an overlay to fade out.
+
+No third-party modules: stdlib only (struct, fcntl, glob), same as trackpad-tap
+and for the same reason -- a shell plugin has no business demanding a pacman
+install before it will start.
+"""
+
+import argparse
+import fcntl
+import glob
+import json
+import os
+import re
+import select
+import signal
+import struct
+import sys
+import time
+
+# ---------------------------------------------------------------------------
+# evdev ABI. See linux/input.h and linux/input-event-codes.h.
+# ---------------------------------------------------------------------------
+
+# struct input_event on a 64-bit kernel: struct timeval (two longs) then
+# __u16 type, __u16 code, __s32 value. 24 bytes, no tail padding.
+EVENT_FORMAT = "llHHi"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+assert EVENT_SIZE == 24, EVENT_SIZE
+
+EV_SYN = 0x00
+EV_KEY = 0x01
+EV_ABS = 0x03
+
+SYN_REPORT = 0x00
+
+BTN_LEFT = 0x110
+BTN_TOUCH = 0x14A
+
+ABS_MT_SLOT = 0x2F
+ABS_MT_TOUCH_MAJOR = 0x30
+ABS_MT_POSITION_X = 0x35
+ABS_MT_POSITION_Y = 0x36
+ABS_MT_TRACKING_ID = 0x39
+ABS_MT_PRESSURE = 0x3A
+
+_IOC_READ = 2
+
+
+def _ior(nr, size):
+    return (_IOC_READ << 30) | (size << 16) | (ord("E") << 8) | nr
+
+
+# struct input_absinfo { __s32 value, minimum, maximum, fuzz, flat, resolution; }
+ABSINFO_FORMAT = "iiiiii"
+ABSINFO_SIZE = struct.calcsize(ABSINFO_FORMAT)
+
+# struct input_id { __u16 bustype, vendor, product, version; }
+EVIOCGID = _ior(0x02, 8)
+
+
+def EVIOCGABS(code):
+    return _ior(0x40 + code, ABSINFO_SIZE)
+
+
+def EVIOCGNAME(length):
+    return _ior(0x06, length)
+
+
+def EVIOCGPROP(length):
+    return _ior(0x09, length)
+
+
+# INPUT_PROP_* from linux/input-event-codes.h.
+INPUT_PROP_POINTER = 0x00        # indirect: a pad, not a screen
+INPUT_PROP_DIRECT = 0x01         # you touch the thing you are pointing at
+INPUT_PROP_BUTTONPAD = 0x02
+INPUT_PROP_SEMI_MT = 0x03        # bounding box only, no real per-finger data
+INPUT_PROP_POINTING_STICK = 0x05
+INPUT_PROP_ACCELEROMETER = 0x06
+INPUT_PROP_CNT = 32
+
+# Names only, for a nicer label. Absence costs a pretty string and nothing else:
+# an unlisted panel is still opened, read and drawn.
+KNOWN_PRODUCTS = {
+    (0x06CB, 0x16D6): "Synaptics touchscreen",
+    (0x04F3, 0x0000): "Elan touchscreen",
+    (0x27C6, 0x0000): "Goodix touchscreen",
+}
+
+
+def device_props(fd):
+    """The INPUT_PROP_* bitmap, as a set of bit numbers."""
+    buf = bytearray(INPUT_PROP_CNT // 8)
+    try:
+        fcntl.ioctl(fd, EVIOCGPROP(len(buf)), buf)
+    except OSError:
+        return set()
+    bits = int.from_bytes(bytes(buf), "little")
+    return {i for i in range(INPUT_PROP_CNT) if (bits >> i) & 1}
+
+
+def udev_props(path):
+    """udev's own verdict, read from its database without shelling out.
+
+    udev's input_id builtin already classifies every input device and libinput
+    trusts it. /run/udev/data/c<major>:<minor> is that verdict on disk. Missing
+    on a very early boot or in a container, which is why this cross-checks the
+    raw property bits rather than replacing them.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    key = "c%d:%d" % (os.major(st.st_rdev), os.minor(st.st_rdev))
+    try:
+        with open("/run/udev/data/" + key) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return {}
+    out = {}
+    for line in lines:
+        if line.startswith("E:") and "=" in line:
+            k, v = line[2:].split("=", 1)
+            out[k] = v
+    return out
+
+
+def classify(fd, path, ranges):
+    """(kind, why) for a screen we can draw on, or (None, why not).
+
+    THE TEST IS A CAPABILITY TEST, NOT A VENDOR LIST -- the same reasoning
+    trackpad-tap gives for the opposite case. A touchscreen is any device with
+    multitouch position axes that is DIRECT. That is true of the Synaptics i2c
+    panel in this Yoga, of an Elan or Goodix panel, and of a USB-attached
+    external monitor's digitizer, and it is false for every trackpad, which is
+    exactly the separation we want.
+    """
+    if ABS_MT_POSITION_X not in ranges or ABS_MT_POSITION_Y not in ranges:
+        return None, "no multitouch position axes"
+
+    props = device_props(fd)
+
+    if INPUT_PROP_ACCELEROMETER in props:
+        return None, "accelerometer"
+    if INPUT_PROP_POINTING_STICK in props:
+        return None, "pointing stick"
+
+    # The whole point of this script. DIRECT is the kernel saying the contact
+    # coordinate and the screen coordinate are the same coordinate.
+    if INPUT_PROP_DIRECT in props:
+        return "touchscreen", "INPUT_PROP_DIRECT"
+
+    u = udev_props(path)
+    if u.get("ID_INPUT_TOUCHSCREEN") == "1":
+        return "touchscreen", "udev ID_INPUT_TOUCHSCREEN"
+
+    # Everything below here is a pad, not a screen. Say so precisely: pointing
+    # someone at trackpad-tap is far more useful than "not supported".
+    if u.get("ID_INPUT_TOUCHPAD") == "1":
+        return None, "touchpad (use trackpad-tap for this one)"
+    if u.get("ID_INPUT_TABLET") == "1":
+        return None, "graphics tablet (use trackpad-tap for this one)"
+    if INPUT_PROP_POINTER in props or INPUT_PROP_BUTTONPAD in props:
+        return None, "indirect pointing surface (use trackpad-tap)"
+
+    return None, "multitouch, but not a direct-touch screen"
+
+
+def candidates():
+    """Every evdev node, in numeric order.
+
+    Deliberately not a by-id glob: /dev/input/by-id is built from USB
+    descriptors and is EMPTY for anything on i2c, which is where essentially
+    every laptop touchscreen lives -- including the SYNA7501 in this machine,
+    whose only by-path entry is an i2c_designware platform path.
+    """
+    return sorted(
+        glob.glob("/dev/input/event*"),
+        key=lambda p: int(re.sub(r"\D", "", p) or 0),
+    )
+
+
+def device_identity(fd):
+    """Read name and bus/vendor/product straight off the fd, never from a path."""
+    name = bytearray(256)
+    try:
+        fcntl.ioctl(fd, EVIOCGNAME(len(name)), name)
+        name = name.split(b"\x00", 1)[0].decode("utf-8", "replace")
+    except OSError:
+        name = "unknown"
+
+    ids = bytearray(8)
+    try:
+        fcntl.ioctl(fd, EVIOCGID, ids)
+        bustype, vendor, product, version = struct.unpack("HHHH", bytes(ids))
+    except OSError:
+        bustype = vendor = product = version = 0
+
+    return {
+        "name": name,
+        "bustype": bustype,
+        "vendor": vendor,
+        "product": product,
+        "version": version,
+        "model": KNOWN_PRODUCTS.get((vendor, product)) or name or "Touchscreen",
+    }
+
+
+def axis_range(fd, code):
+    """EVIOCGABS for one axis. Returns (min, max, resolution) or None."""
+    buf = bytearray(ABSINFO_SIZE)
+    try:
+        fcntl.ioctl(fd, EVIOCGABS(code), buf)
+    except OSError:
+        return None
+    value, minimum, maximum, fuzz, flat, resolution = struct.unpack(
+        ABSINFO_FORMAT, bytes(buf)
+    )
+    if maximum <= minimum:
+        return None
+    return (minimum, maximum, resolution)
+
+
+def physical_size(ranges):
+    """(width_mm, height_mm) from axis resolution, or (None, None).
+
+    Panels very often report resolution 0 where a trackpad reports a real
+    units-per-mm figure, so unlike the trackpad case this is usually unknown --
+    and that is fine. A touchscreen HUD draws in display space and never needs
+    the physical size; it is reported only so the panel can show it when the
+    hardware bothers to say.
+    """
+    out = []
+    for code in (ABS_MT_POSITION_X, ABS_MT_POSITION_Y):
+        rng = ranges.get(code)
+        if not rng or not rng[2]:
+            out.append(None)
+        else:
+            lo, hi, res = rng
+            out.append(round((hi - lo) / float(res), 1))
+    return out[0], out[1]
+
+
+def read_ranges(fd):
+    ranges = {}
+    for code in (
+        ABS_MT_POSITION_X,
+        ABS_MT_POSITION_Y,
+        ABS_MT_PRESSURE,
+        ABS_MT_TOUCH_MAJOR,
+    ):
+        rng = axis_range(fd, code)
+        if rng:
+            ranges[code] = rng
+    return ranges
+
+
+def max_slots(fd):
+    """How many simultaneous contacts the panel will report.
+
+    ABS_MT_SLOT's own axis maximum is the answer, and it is worth surfacing:
+    old panels commonly cap at 2 where a modern one does 10, and that ceiling
+    is the single most useful thing to know before relying on a gesture.
+    """
+    rng = axis_range(fd, ABS_MT_SLOT)
+    return (rng[1] + 1) if rng else 1
+
+
+def probe(explicit=None, prefer=None):
+    """Find every drawable touchscreen, grouped by physical device.
+
+    Opens every interface of the chosen device rather than picking one, for the
+    reason trackpad-tap documents at length: a device may register several
+    indistinguishable interfaces and only one of them ever emits a byte.
+    """
+    paths = [explicit] if explicit else candidates()
+    seen, groups, errors = set(), {}, []
+
+    for path in paths:
+        real = os.path.realpath(path)
+        if real in seen:
+            continue
+        seen.add(real)
+        try:
+            fd = os.open(real, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            # Most nodes we cannot open are simply not ours. Only say so when
+            # the caller named one explicitly -- except for EACCES, which is
+            # the `input` group problem and is worth naming every time, since
+            # it is otherwise indistinguishable from "no touchscreen fitted".
+            if explicit or exc.errno == 13:
+                errors.append("%s: %s" % (real, exc.strerror))
+            continue
+
+        ranges = read_ranges(fd)
+        kind, why = classify(fd, real, ranges)
+        if not kind and not explicit:
+            os.close(fd)
+            continue
+        if not kind:
+            os.close(fd)
+            errors.append("%s: %s" % (real, why))
+            continue
+
+        ident = device_identity(fd)
+        props = device_props(fd)
+        ident["kind"] = kind
+        ident["why"] = why
+        ident["semi_mt"] = INPUT_PROP_SEMI_MT in props
+        ident["slots"] = max_slots(fd)
+        w, h = physical_size(ranges)
+        ident["width_mm"], ident["height_mm"] = w, h
+
+        key = (ident["vendor"], ident["product"], ident["name"])
+        groups.setdefault(key, {"ident": ident, "interfaces": []})
+        groups[key]["interfaces"].append(
+            {"fd": fd, "path": real, "ident": ident, "ranges": ranges}
+        )
+
+    if not groups:
+        return None, [], errors
+
+    def score(item):
+        key, group = item
+        ident = group["ident"]
+        haystack = (ident["name"] or "").lower() + " " + (ident["model"] or "").lower()
+        if prefer and prefer.lower() in haystack:
+            return (0, "")
+        # NO EXTERNAL-FIRST RULE HERE, and that is a real difference from
+        # trackpad-tap. Plugging in a trackpad means you intend to use it; a
+        # second touchscreen is usually an external monitor that happens to
+        # have a digitizer, and the built-in panel is still the one under your
+        # hand. So: built-in first. Bus 0x18 is host/i2c, 0x11 is i8042.
+        internal = ident["bustype"] in (0x11, 0x18)
+        return (0 if internal else 1, (ident["name"] or "").lower())
+
+    ordered = sorted(groups.items(), key=score)
+    chosen_key = ordered[0][0]
+
+    for key, group in groups.items():
+        if key != chosen_key:
+            for iface in group["interfaces"]:
+                os.close(iface["fd"])
+
+    devices = [dict(group["ident"], interfaces=len(group["interfaces"]))
+               for _, group in ordered]
+    return groups[chosen_key], devices, errors
+
+
+def open_devices(explicit=None, prefer=None):
+    chosen, devices, errors = probe(explicit, prefer)
+    if not chosen:
+        hint = "\n  ".join(errors) if errors else (
+            "no direct-touch device in /dev/input (a trackpad does not count -- "
+            "use trackpad-tap for that)"
+        )
+        raise SystemExit("touch-tap: no touchscreen found.\n  " + hint)
+    return chosen["interfaces"]
+
+
+# ---------------------------------------------------------------------------
+# Multitouch protocol B decoding
+# ---------------------------------------------------------------------------
+
+
+class Surface:
+    """Accumulates slot state and emits one frame per SYN_REPORT.
+
+    Protocol B is stateful: the kernel sends ABS_MT_SLOT to select a slot and
+    then only the axes that CHANGED for that slot, with a tracking id of -1
+    retiring it. So the decoder holds the whole picture and re-emits it every
+    frame; reading events one at a time and expecting a whole contact is the
+    classic way to produce a stream of half-updated coordinates.
+    """
+
+    def __init__(self, ranges, swap_xy=False, invert_x=False, invert_y=False):
+        self.ranges = ranges
+        self.swap_xy = swap_xy
+        self.invert_x = invert_x
+        self.invert_y = invert_y
+        self.slots = {}
+        self.slot = 0
+        self.click = False
+        self.had_contacts = False
+
+    def _norm(self, code, raw):
+        rng = self.ranges.get(code)
+        if not rng:
+            return None
+        lo, hi, _res = rng
+        return max(0.0, min(1.0, (raw - lo) / float(hi - lo)))
+
+    def feed(self, etype, code, value):
+        """Apply one event. Returns a frame dict at SYN_REPORT, else None."""
+        if etype == EV_ABS:
+            if code == ABS_MT_SLOT:
+                self.slot = value
+                return None
+            slot = self.slots.setdefault(self.slot, {})
+            if code == ABS_MT_TRACKING_ID:
+                if value == -1:
+                    self.slots.pop(self.slot, None)
+                else:
+                    slot["id"] = value
+            elif code == ABS_MT_POSITION_X:
+                slot["x"] = value
+            elif code == ABS_MT_POSITION_Y:
+                slot["y"] = value
+            elif code == ABS_MT_PRESSURE:
+                slot["p"] = value
+            elif code == ABS_MT_TOUCH_MAJOR:
+                slot["a"] = value
+            return None
+
+        if etype == EV_KEY and code in (BTN_LEFT, BTN_TOUCH):
+            # BTN_TOUCH on a screen means "something is in contact", which is
+            # already implied by a live slot. Tracked anyway so a consumer that
+            # wants a click-equivalent has one, and so the field matches
+            # trackpad-tap's shape.
+            if code == BTN_LEFT:
+                self.click = bool(value)
+            return None
+
+        if etype == EV_SYN and code == SYN_REPORT:
+            return self.frame()
+
+        return None
+
+    def frame(self):
+        contacts = []
+        for slot in sorted(self.slots):
+            st = self.slots[slot]
+            if "x" not in st or "y" not in st or "id" not in st:
+                continue
+            x = self._norm(ABS_MT_POSITION_X, st["x"])
+            y = self._norm(ABS_MT_POSITION_Y, st["y"])
+            if x is None or y is None:
+                continue
+
+            # ORIENTATION IS A PANEL PROBLEM, NOT A CONVENTION PROBLEM.
+            #
+            # trackpad-tap can assert that evdev's touchpad convention already
+            # matches screen orientation and leave it alone. A touchscreen
+            # cannot: the digitizer is glued to the panel in whatever rotation
+            # the OEM chose, and on a convertible the display itself rotates
+            # underneath it. There is no convention that saves us, so these are
+            # explicit knobs, defaulting to off -- and the plugin's transform
+            # setting drives them rather than guessing.
+            if self.swap_xy:
+                x, y = y, x
+            if self.invert_x:
+                x = 1.0 - x
+            if self.invert_y:
+                y = 1.0 - y
+
+            contact = {"x": round(x, 4), "y": round(y, 4), "id": st["id"]}
+            p = self._norm(ABS_MT_PRESSURE, st.get("p", 0))
+            if p is not None:
+                contact["p"] = round(p, 4)
+            contacts.append(contact)
+
+        # Idle stays silent, but the transition to idle must be announced once
+        # or an overlay never learns the hand is gone.
+        if not contacts:
+            if not self.had_contacts:
+                return None
+            self.had_contacts = False
+            return {"n": 0, "click": self.click, "f": []}
+
+        self.had_contacts = True
+        return {"n": len(contacts), "click": self.click, "f": contacts}
+
+
+# ---------------------------------------------------------------------------
+# Modes
+# ---------------------------------------------------------------------------
+
+
+def emit(obj, out=sys.stdout):
+    out.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    out.flush()
+
+
+def surface_for(args, ranges):
+    return Surface(
+        ranges,
+        swap_xy=args.swap_xy,
+        invert_x=args.invert_x,
+        invert_y=args.invert_y,
+    )
+
+
+def mode_once(args):
+    chosen, devices, errors = probe(args.device, args.prefer)
+    if not chosen:
+        emit({"interfaces": [], "devices": [], "errors": errors})
+        return 1
+
+    out = []
+    for d in chosen["interfaces"]:
+        ident = d["ident"]
+        out.append({
+            "device": d["path"],
+            "name": ident["name"],
+            "model": ident["model"],
+            "kind": ident["kind"],
+            "vendor": "%04x" % ident["vendor"],
+            "product": "%04x" % ident["product"],
+            "bus": ident["bustype"],
+            "semi_mt": ident["semi_mt"],
+            "slots": ident["slots"],
+            "width_mm": ident["width_mm"],
+            "height_mm": ident["height_mm"],
+            "axes": {
+                "x": d["ranges"].get(ABS_MT_POSITION_X),
+                "y": d["ranges"].get(ABS_MT_POSITION_Y),
+                "pressure": d["ranges"].get(ABS_MT_PRESSURE),
+                "touch_major": d["ranges"].get(ABS_MT_TOUCH_MAJOR),
+            },
+        })
+        os.close(d["fd"])
+
+    emit({
+        "interfaces": out,
+        "devices": [
+            {
+                "name": d["name"],
+                "model": d["model"],
+                "kind": d["kind"],
+                "vendor": "%04x" % d["vendor"],
+                "product": "%04x" % d["product"],
+                "bus": d["bustype"],
+                "interfaces": d["interfaces"],
+                "slots": d["slots"],
+                "width_mm": d["width_mm"],
+                "height_mm": d["height_mm"],
+                "internal": d["bustype"] in (0x11, 0x18),
+            }
+            for d in devices
+        ],
+        "errors": errors,
+    })
+    return 0
+
+
+def mode_stream(args):
+    devs = open_devices(args.device, args.prefer)
+    if args.verbose:
+        for d in devs:
+            print(f"# {d['ident']['model']} on {d['path']}", file=sys.stderr)
+
+    recorder = open(args.record, "wb") if args.record else None
+    if recorder:
+        ranges = devs[0]["ranges"]
+        recorder.write(
+            json.dumps({"ranges": {str(k): list(v) for k, v in ranges.items()}}).encode()
+            + b"\n"
+        )
+
+    # One decoder per interface: they are separate devices as far as protocol B
+    # is concerned, and sharing slot state between them would interleave two
+    # devices' slots into one incoherent frame.
+    surfaces = {d["fd"]: surface_for(args, d["ranges"]) for d in devs}
+    fds = list(surfaces.keys())
+
+    try:
+        while True:
+            ready, _, _ = select.select(fds, [], [], 1.0)
+            for fd in ready:
+                try:
+                    data = os.read(fd, EVENT_SIZE * 64)
+                except (OSError, BlockingIOError):
+                    continue
+                if not data:
+                    continue
+                if recorder:
+                    recorder.write(data)
+                surface = surfaces[fd]
+                for off in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
+                    _s, _us, etype, code, value = struct.unpack(
+                        EVENT_FORMAT, data[off:off + EVENT_SIZE]
+                    )
+                    frame = surface.feed(etype, code, value)
+                    if frame is not None:
+                        emit(frame)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if recorder:
+            recorder.close()
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return 0
+
+
+def mode_replay(args):
+    """Replay a fixture. The only way to exercise the decoder without the
+    `input` group, which is precisely the situation this plugin was written in.
+    """
+    with open(args.replay, "rb") as fh:
+        header = fh.readline()
+        try:
+            meta = json.loads(header)
+            ranges = {int(k): tuple(v) for k, v in meta.get("ranges", {}).items()}
+        except (ValueError, AttributeError):
+            raise SystemExit("touch-tap: %s is not a fixture (bad header)" % args.replay)
+        surface = surface_for(args, ranges)
+        data = fh.read()
+
+    last = None
+    for off in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
+        sec, usec, etype, code, value = struct.unpack(
+            EVENT_FORMAT, data[off:off + EVENT_SIZE]
+        )
+        if args.speed > 0:
+            t = sec + usec / 1e6
+            if last is not None and t > last:
+                time.sleep(min((t - last) / args.speed, 1.0))
+            last = t
+        frame = surface.feed(etype, code, value)
+        if frame is not None:
+            emit(frame)
+    return 0
+
+
+def mode_synth(args):
+    """Write a synthetic two-contact pinch fixture.
+
+    Two contacts, not three: this exists to be a realistic exercise of an OLD
+    panel, and a 2017 laptop digitizer very commonly tops out at two slots.
+    """
+    xmin, xmax = 0, 3999
+    ymin, ymax = 0, 2239
+    pmin, pmax = 0, 255
+    ranges = {
+        ABS_MT_POSITION_X: (xmin, xmax, 0),
+        ABS_MT_POSITION_Y: (ymin, ymax, 0),
+        ABS_MT_PRESSURE: (pmin, pmax, 0),
+    }
+
+    out = open(args.synth, "wb") if args.synth != "-" else sys.stdout.buffer
+    out.write(
+        json.dumps({"ranges": {str(k): list(v) for k, v in ranges.items()}}).encode()
+        + b"\n"
+    )
+
+    def ev(t, etype, code, value):
+        sec = int(t)
+        usec = int((t - sec) * 1e6)
+        out.write(struct.pack(EVENT_FORMAT, sec, usec, etype, code, value))
+
+    t = 1000.0
+    steps = 48
+    for i in range(steps):
+        frac = i / float(steps - 1)
+        # Pinch open: the two contacts start together and separate.
+        spread = 0.05 + 0.30 * frac
+        for slot in range(2):
+            ev(t, EV_ABS, ABS_MT_SLOT, slot)
+            if i == 0:
+                ev(t, EV_ABS, ABS_MT_TRACKING_ID, 200 + slot)
+            cx = 0.5 + (spread if slot else -spread)
+            ev(t, EV_ABS, ABS_MT_POSITION_X, int(xmin + cx * (xmax - xmin)))
+            ev(t, EV_ABS, ABS_MT_POSITION_Y, int(ymin + 0.5 * (ymax - ymin)))
+            ev(t, EV_ABS, ABS_MT_PRESSURE, int(pmax * 0.5))
+        ev(t, EV_SYN, SYN_REPORT, 0)
+        t += 1.0 / 60.0
+
+    for slot in range(2):
+        ev(t, EV_ABS, ABS_MT_SLOT, slot)
+        ev(t, EV_ABS, ABS_MT_TRACKING_ID, -1)
+    ev(t, EV_SYN, SYN_REPORT, 0)
+
+    if out is not sys.stdout.buffer:
+        out.close()
+        print(f"wrote {args.synth}", file=sys.stderr)
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="touch-tap",
+        description="Stream touchscreen contact positions as JSON lines.",
+    )
+    ap.add_argument("--device", help="evdev node to read instead of autodetecting")
+    ap.add_argument("--prefer", metavar="SUBSTRING",
+                    help="pick the screen whose name contains this, when more "
+                         "than one is attached (default: the built-in panel)")
+    ap.add_argument("--once", action="store_true", help="print device info and exit")
+    ap.add_argument("--record", metavar="FILE", help="also save raw events as a fixture")
+    ap.add_argument("--replay", metavar="FILE", help="replay a fixture instead of reading hardware")
+    ap.add_argument("--synth", metavar="FILE", help="write a synthetic pinch fixture ('-' for stdout)")
+    ap.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier (0 = as fast as possible)")
+    ap.add_argument("--swap-xy", action="store_true",
+                    help="swap X and Y. Needed on a panel mounted rotated 90 degrees.")
+    ap.add_argument("--invert-x", action="store_true", help="mirror horizontally")
+    ap.add_argument("--invert-y", action="store_true", help="mirror vertically")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    if args.synth:
+        return mode_synth(args)
+    if args.replay:
+        return mode_replay(args)
+    if args.once:
+        return mode_once(args)
+    return mode_stream(args)
+
+
+if __name__ == "__main__":
+    # A streaming tool gets its stdout closed by whatever is reading it. The
+    # default Python handler turns that into a BrokenPipeError traceback on the
+    # way out, which lands in the shell log looking like a crash. Die quietly.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    sys.exit(main())

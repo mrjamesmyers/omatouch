@@ -1,0 +1,182 @@
+{
+  "schemaVersion": 1,
+  "id": "prezziej.touchscreen",
+  "name": "Touchscreen",
+  "version": "0.1.0",
+  "author": "prezziej",
+  "license": "MIT",
+  "description": "Touchscreens and tablet posture on Omarchy: enable or disable the panel, bind it to the right monitor, correct or auto-follow its rotation, fold into tablet mode with the keyboard and touchpad out of the way, and see every contact drawn where your finger actually is.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Touchscreen",
+    "description": "Enable, orient and visualise a touchscreen.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "enabled": true,
+      "hud": true,
+      "hudMinContacts": 1,
+      "hudStyle": "ripple",
+      "transform": 0,
+      "output": "",
+      "device": "",
+      "disableWhenLidClosed": true,
+      "autoRotate": true,
+      "autoTabletMode": false,
+      "tabletMode": false,
+      "tabletDisablesKeyboard": true,
+      "tabletDisablesTouchpad": true
+    },
+    "schema": [
+      {
+        "key": "enabled",
+        "type": "boolean",
+        "label": "Touchscreen",
+        "description": "Turn the panel off entirely. On a convertible this is the setting you actually reach for.",
+        "defaultValue": true
+      },
+      {
+        "key": "transform",
+        "type": "enum",
+        "label": "Rotation",
+        "description": "Correct a digitizer mounted at a different rotation from the display. If touches land at 90 degrees to your finger, this is the setting.",
+        "options": [
+          {
+            "value": 0,
+            "label": "Normal"
+          },
+          {
+            "value": 1,
+            "label": "90 degrees"
+          },
+          {
+            "value": 2,
+            "label": "180 degrees"
+          },
+          {
+            "value": 3,
+            "label": "270 degrees"
+          },
+          {
+            "value": 4,
+            "label": "Flipped"
+          },
+          {
+            "value": 5,
+            "label": "Flipped, 90 degrees"
+          },
+          {
+            "value": 6,
+            "label": "Flipped, 180 degrees"
+          },
+          {
+            "value": 7,
+            "label": "Flipped, 270 degrees"
+          }
+        ],
+        "defaultValue": 0
+      },
+      {
+        "key": "autoRotate",
+        "type": "boolean",
+        "label": "Auto-rotate display",
+        "description": "Follow the accelerometer: rotate the screen and the touchscreen together when you turn the machine.",
+        "defaultValue": true
+      },
+      {
+        "key": "tabletMode",
+        "type": "boolean",
+        "label": "Tablet mode",
+        "description": "Turn off the keyboard and touchpad so a folded-back screen does not type on whatever it is resting against.",
+        "defaultValue": false
+      },
+      {
+        "key": "autoTabletMode",
+        "type": "boolean",
+        "label": "Enter tablet mode automatically",
+        "description": "Off by default, and deliberately. This Yoga reports no SW_TABLET_MODE switch, so folded-back is INFERRED from orientation - and a laptop lying flat on a desk looks identical to a tablet lying flat. Turn this on if you want it to guess.",
+        "defaultValue": false
+      },
+      {
+        "key": "tabletDisablesKeyboard",
+        "type": "boolean",
+        "label": "Tablet mode disables keyboard",
+        "description": "",
+        "defaultValue": true
+      },
+      {
+        "key": "tabletDisablesTouchpad",
+        "type": "boolean",
+        "label": "Tablet mode disables touchpad",
+        "description": "",
+        "defaultValue": true
+      },
+      {
+        "key": "output",
+        "type": "string",
+        "label": "Bound to monitor",
+        "description": "Which display this panel drives. Empty lets Hyprland decide, which is right until you plug in a second screen and your taps land on the wrong one.",
+        "defaultValue": ""
+      },
+      {
+        "key": "hud",
+        "type": "boolean",
+        "label": "Contact HUD",
+        "description": "Draw each contact where it actually is on the glass. The fastest way to see whether a patch of an old panel has stopped responding.",
+        "defaultValue": true
+      },
+      {
+        "key": "hudMinContacts",
+        "type": "integer",
+        "label": "Show HUD from",
+        "description": "Fewest simultaneous contacts that summons the HUD. One shows every tap; raise it if that becomes noise.",
+        "min": 1,
+        "max": 5,
+        "defaultValue": 1
+      },
+      {
+        "key": "hudStyle",
+        "type": "enum",
+        "label": "HUD style",
+        "description": "How a contact is drawn.",
+        "options": [
+          {
+            "value": "ripple",
+            "label": "Ripple"
+          },
+          {
+            "value": "dot",
+            "label": "Dot"
+          },
+          {
+            "value": "crosshair",
+            "label": "Crosshair"
+          }
+        ],
+        "defaultValue": "ripple"
+      },
+      {
+        "key": "disableWhenLidClosed",
+        "type": "boolean",
+        "label": "Off when the lid is shut",
+        "description": "A folded convertible presses its own screen against the base. Without this, that reads as a stream of phantom touches.",
+        "defaultValue": true
+      },
+      {
+        "key": "device",
+        "type": "string",
+        "label": "Touchscreen",
+        "description": "Which panel to drive when more than one is attached. Empty prefers the built-in one.",
+        "defaultValue": ""
+      }
+    ]
+  }
+}

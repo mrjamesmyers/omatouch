@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Read and set what happens when the lid closes.
+
+    clamshell status      what logind will do, as JSON
+    clamshell on          keep running with the lid shut
+    clamshell off         restore the distribution default
+
+WHY THIS IS NOT JUST A SETTING IN THE PLUGIN.
+
+Everything else the touchscreen plugin controls lives in the user's own
+Hyprland config. This one is systemd-logind policy in /etc, so it needs root to
+change -- but only to change. The effective value is readable over D-Bus by
+anyone, which is what `status` uses, so the panel can always show the truth
+even when it cannot alter it.
+
+RELOAD, NEVER RESTART.
+
+`systemctl restart systemd-logind` tears down the login session it owns: the
+compositor and everything in it goes with it. That was learned the hard way on
+this machine -- a restart to apply this very setting took the desktop down and
+back up. `reload` re-reads the configuration and leaves the session alone.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+DROPIN = "/etc/systemd/logind.conf.d/30-omacar-clamshell.conf"
+
+BODY = """# Clamshell mode, written by the omatouch plugin.
+#
+# This laptop runs on a stand in a car, logging OBD-II. The systemd default is
+# HandleLidSwitch=suspend, which kills whatever is running the moment the lid
+# is closed. `ignore` keeps it awake.
+#
+# The trade: a closed lid no longer sleeps the machine, so it will flatten the
+# battery if closed and left. Right for a car computer, wrong for a laptop in a
+# bag.
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+"""
+
+
+def prop(name):
+    """One logind property, over D-Bus. No root needed."""
+    try:
+        out = subprocess.run(
+            ["busctl", "get-property", "org.freedesktop.login1",
+             "/org/freedesktop/login1", "org.freedesktop.login1.Manager", name],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    # `s "ignore"` -> ignore
+    parts = out.stdout.strip().split('"')
+    return parts[1] if len(parts) > 1 else None
+
+
+def lid_state():
+    import glob
+    for p in glob.glob("/proc/acpi/button/lid/*/state"):
+        try:
+            with open(p, encoding="utf-8") as f:
+                return "closed" if "closed" in f.read() else "open"
+        except OSError:
+            continue
+    return None
+
+
+def status():
+    on_battery = prop("HandleLidSwitch")
+    on_ac = prop("HandleLidSwitchExternalPower")
+    return {
+        "on_battery": on_battery,
+        "on_ac": on_ac,
+        # Clamshell only counts when BOTH ignore it. A machine that stays awake
+        # on mains and sleeps on battery is not "clamshell", it is a surprise
+        # waiting for the first time you unplug it in the car.
+        "clamshell": on_battery == "ignore" and on_ac == "ignore",
+        "lid": lid_state(),
+        "managed": os.path.exists(DROPIN),
+    }
+
+
+def apply(enable):
+    if enable:
+        script = (
+            "install -d -m 755 /etc/systemd/logind.conf.d && "
+            "cat > %s <<'OMATOUCH_EOF'\n%sOMATOUCH_EOF\n"
+            "systemctl reload systemd-logind" % (DROPIN, BODY))
+    else:
+        script = "rm -f %s && systemctl reload systemd-logind" % DROPIN
+    try:
+        r = subprocess.run(["pkexec", "bash", "-c", script],
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    if r.returncode != 0:
+        # 126/127 is the polkit dialog being dismissed or unavailable, which is
+        # a refusal rather than a failure and deserves a different sentence.
+        if r.returncode in (126, 127):
+            return False, "authorisation was declined"
+        return False, (r.stderr or r.stdout or "pkexec failed").strip()[:200]
+    return True, ""
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="clamshell")
+    ap.add_argument("action", nargs="?", default="status",
+                    choices=["status", "on", "off"])
+    args = ap.parse_args()
+
+    if args.action == "status":
+        print(json.dumps(status()))
+        return 0
+
+    ok, why = apply(args.action == "on")
+    out = status()
+    out["ok"] = ok
+    if why:
+        out["error"] = why
+    print(json.dumps(out))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
