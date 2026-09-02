@@ -123,6 +123,42 @@ assert that evdev's touchpad convention already matches screen orientation; a
 touchscreen cannot, because the digitizer is bonded to the panel in whatever
 rotation the OEM chose.
 
+## When it does not work
+
+    ./scripts/doctor
+
+This plugin was written against one digitizer. When a plugin does not work on
+hardware its author never had, the user has no way to tell *which* of a dozen
+things is wrong — they get a screen that does not respond and a plugin that
+says nothing.
+
+The doctor checks the things that actually go wrong, and each finding says what
+to do about it: `input` group membership (and whether *this session* predates
+it, which is the commonest one), whether a direct-touch digitizer exists at
+all, whether the one picked is a stylus surface rather than a finger surface,
+whether Hyprland sees it, whether it is bound to an output, whether the
+digitizer's aspect ratio matches the monitor it is mapped to, whether the
+rotation setting matches the monitor's transform, and whether the installed
+copy matches your checkout.
+
+The geometry check is the one worth knowing about. A digitizer reports its own
+coordinate range; if that aspect ratio does not match the monitor's, touch will
+land offset from your finger. That is the commonest multi-monitor complaint on
+any compositor, and it is arithmetic rather than something you have to notice.
+
+Reporting a problem? `./scripts/doctor --json` is what to attach.
+
+## Hardware
+
+`hardware.json` records the digitizers this has actually been run against —
+currently one. The doctor tells you whether yours is among them.
+
+An unknown digitizer is not a warning, it is the expected case. If the plugin
+works on yours, adding an entry is the most useful thing you can contribute;
+if it does not, that is worth recording too. The `quirks` field is the part
+that compounds: the specific thing that had to be done for that device, so the
+next person with it does not rediscover it.
+
 ## Tested against
 
 Synaptics `SYNA7501:00 06CB:16D6` (i2c) in a Lenovo Yoga 710-15IKB — a 2017

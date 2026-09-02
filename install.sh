@@ -63,7 +63,7 @@ install_changed_exec() { # src dst
   install -m 755 "$1" "$2"
 }
 
-for f in touch-tap orientation clamshell; do
+for f in touch-tap orientation clamshell doctor; do
   install_changed_exec "$ROOT/scripts/$f" "$PLUGIN_DIR/scripts/$f"
 done
 

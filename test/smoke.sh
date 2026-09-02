@@ -1034,11 +1034,11 @@ PDIR="$FAKE/.config/omarchy/plugins/prezziej.touchscreen"
 # LC_ALL=C: the default collation ignores the '/' and interleaves scripts/* with
 # the top-level files, which makes the expected list unreadable.
 got_files="$(cd "$PDIR" 2>/dev/null && find . -type f -printf '%P\n' | LC_ALL=C sort | tr '\n' ' ')"
-want_files="BarWidget.qml Hud.qml Overlay.qml Panel.qml Service.qml manifest.json scripts/clamshell scripts/orientation scripts/touch-tap "
+want_files="BarWidget.qml Hud.qml Overlay.qml Panel.qml Service.qml manifest.json scripts/clamshell scripts/doctor scripts/orientation scripts/touch-tap "
 # An explicit list, not a glob: the shell compiles every .qml it finds in the
 # plugin dir, so a lab or scratch file swept in would be compiled by the shell,
 # and fixtures have no business shipping at all.
-check "install.sh ships exactly the six plugin files and three scripts" "$want_files" "$got_files"
+check "install.sh ships exactly the six plugin files and four scripts" "$want_files" "$got_files"
 
 modes="$(stat -c '%a' "$PDIR"/scripts/* 2>/dev/null | sort -u | tr '\n' ' ')"
 check "the installed scripts are mode 755" "755 " "$modes"
@@ -1104,6 +1104,55 @@ group_case "granted since login" "wheel smoketest" "wheel input smoketest" \
   "THIS session predates it"
 group_case "not a member" "wheel smoketest" "wheel smoketest" \
   "not a member"
+
+# ---------------------------------------------------------------- doctor
+#
+# The doctor exists for machines nobody here has. So these check the things
+# that must hold on ANY machine -- that it runs, that it emits parseable JSON,
+# that it never modifies anything -- rather than asserting findings that are
+# true only of this laptop.
+printf '\n  doctor\n'
+
+doctor_out="$($ROOT/scripts/doctor 2>&1)"; doctor_rc=$?
+[[ $doctor_rc -eq 0 || $doctor_rc -eq 1 ]] \
+  && ok "doctor exits 0 (healthy) or 1 (problems), got $doctor_rc" \
+  || { printf ' FAIL  doctor exited %s\n' "$doctor_rc"; ((fails++)); }
+
+grep -q "omatouch doctor" <<<"$doctor_out" \
+  && ok "doctor prints a heading" \
+  || { printf ' FAIL  doctor printed no heading\n'; ((fails++)); }
+
+doctor_json="$($ROOT/scripts/doctor --json 2>/dev/null)"
+if python3 -c "
+import json,sys
+d=json.loads(sys.stdin.read())
+assert isinstance(d.get('findings'), list), 'findings'
+assert all({'level','area','detail'} <= set(f) for f in d['findings']), 'shape'
+assert all(f['level'] in ('ok','warn','bad','info') for f in d['findings']), 'level'
+for k in ('interfaces','monitors','settings'): assert k in d, k
+" <<<"$doctor_json" 2>/dev/null; then
+  ok "--json is a bug report: findings[] with level/area/detail, plus context"
+else
+  printf ' FAIL  doctor --json was not the documented shape\n'; ((fails++))
+fi
+
+# A diagnostic that writes is not a diagnostic.
+grep -qE '\b(open\([^)]*["'"'"']w|subprocess\.(run|call|Popen)\([^)]*(usermod|pkexec|sudo|hyprctl (keyword|dispatch)))' \
+  "$ROOT/scripts/doctor" \
+  && { printf ' FAIL  doctor appears to write or change something\n'; ((fails++)); } \
+  || ok "doctor never opens a file for writing and never invokes sudo/pkexec"
+
+python3 -c "
+import json,sys
+d=json.load(open('$ROOT/hardware.json'))
+ids=[(x['vendor'].lower(),x['product'].lower()) for x in d['digitizers']]
+assert len(ids)==len(set(ids)), 'duplicate digitizer entries'
+for x in d['digitizers']:
+    assert x.get('works') in ('yes','partial','no'), x
+    for k in ('name','machine','tested_by','tested_on'): assert x.get(k), (k,x)
+" 2>/dev/null \
+  && ok "hardware.json: no duplicates, every entry complete" \
+  || { printf ' FAIL  hardware.json is malformed\n'; ((fails++)); }
 
 printf '\n'
 if ((fails)); then echo "  $fails failure(s)."; exit 1; else echo "  All green."; fi

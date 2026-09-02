@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""Why isn't my touchscreen working?
+
+WHY THIS EXISTS.
+
+omatouch was written against exactly one digitizer -- a Synaptics SYNA7501 in a
+Lenovo Yoga 710 -- and the README says so. Everybody else has different
+hardware, and when a plugin does not work on hardware its author never had, the
+user has no way to tell WHICH of a dozen things is wrong. They get a screen
+that does not respond and a plugin that says nothing.
+
+Each check below is a real failure somebody hits, and each one reports what to
+do about it rather than only that something is wrong. Where a check cannot
+reach an answer it says that too: "I could not tell" is a legitimate result and
+is not dressed up as a pass.
+
+Nothing here changes anything. It reads, and it explains.
+"""
+
+import argparse
+import glob
+import json
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+OK, WARN, BAD, INFO = "ok", "warn", "bad", "info"
+
+TONE = {OK: "\033[32m", WARN: "\033[33m", BAD: "\033[31m", INFO: "\033[2m"}
+MARK = {OK: "ok  ", WARN: "warn", BAD: "FAIL", INFO: "--  "}
+RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
+
+
+def run(cmd, **kw):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10, **kw)
+        return r.returncode, r.stdout, r.stderr
+    except (OSError, subprocess.SubprocessError):
+        return 127, "", ""
+
+
+def hypr(args):
+    code, out, _ = run(["hyprctl", "-j"] + args)
+    if code != 0:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+def reader_state():
+    code, out, _ = run([os.path.join(HERE, "touch-tap"), "--once"])
+    try:
+        return json.loads(out), code
+    except ValueError:
+        return None, code
+
+
+# ---- the checks -------------------------------------------------------------
+
+def check_group(add):
+    import grp
+    try:
+        members = grp.getgrnam("input").gr_mem
+    except KeyError:
+        add(BAD, "input group", "there is no `input` group on this system",
+            "That is unusual. Touch devices in /dev/input are normally owned "
+            "by it.")
+        return
+    user = os.environ.get("USER") or ""
+    in_group = user in members or "input" in [
+        grp.getgrgid(g).gr_name for g in os.getgroups()]
+    live = "input" in [grp.getgrgid(g).gr_name for g in os.getgroups()]
+    if live:
+        add(OK, "input group", "this session has it")
+    elif in_group:
+        add(BAD, "input group",
+            "you are a member, but THIS SESSION predates it",
+            "Log out and back in. A new shell is not enough -- group "
+            "membership is fixed when the session starts.")
+    else:
+        add(BAD, "input group", f"{user or 'you'} is not a member",
+            "Run ./install.sh, or: sudo usermod -aG input $USER, then log out "
+            "and back in.")
+
+
+def check_devices(add, state):
+    if state is None:
+        add(BAD, "reader", "scripts/touch-tap did not return JSON",
+            "Run it directly to see what it says: ./scripts/touch-tap --once")
+        return []
+    errs = state.get("errors") or []
+    denied = [e for e in errs if "Permission denied" in str(e)]
+    if denied:
+        add(BAD, "device access", f"{len(denied)} node(s) refused",
+            "This is the input group problem above, not a hardware fault.")
+
+    ifaces = state.get("interfaces") or []
+    if not ifaces:
+        total = len(glob.glob("/dev/input/event*"))
+        add(BAD, "digitizer", f"no direct-touch device among {total} input nodes",
+            "Either this machine has no touchscreen, or its digitizer does not "
+            "set INPUT_PROP_DIRECT. Check `sudo libinput list-devices` for a "
+            "device whose capabilities include touch.")
+        return []
+
+    for d in ifaces:
+        add(OK, "digitizer", f"{d.get('name')} on {d.get('device')}",
+            f"{d.get('slots')} contacts, "
+            f"{d.get('width_mm')}x{d.get('height_mm')} mm")
+    if len(ifaces) > 1:
+        add(WARN, "digitizer", f"{len(ifaces)} direct-touch devices found",
+            "omatouch uses the first unless a device is named in settings. If "
+            "the wrong one is picked, set it explicitly in the panel.")
+    return ifaces
+
+
+def known_hardware():
+    try:
+        with open(os.path.join(HERE, "..", "hardware.json"), encoding="utf-8") as f:
+            return json.load(f).get("digitizers") or []
+    except (OSError, ValueError):
+        return []
+
+
+def check_known(add, ifaces):
+    """Has anybody run this plugin against this digitizer before?
+
+    Not a pass/fail. An unknown device is the expected case for almost
+    everybody -- the plugin has one entry -- and saying so plainly is more
+    useful than silence, because it tells the user whether an odd behaviour is
+    likely theirs alone and worth reporting.
+    """
+    if not ifaces:
+        return
+    known = known_hardware()
+    for d in ifaces:
+        v, p_ = (d.get("vendor") or "").lower(), (d.get("product") or "").lower()
+        hit = next((k for k in known
+                    if k.get("vendor", "").lower() == v
+                    and k.get("product", "").lower() == p_), None)
+        if hit:
+            note = hit.get("quirks") or ""
+            add(OK if hit.get("works") == "yes" else WARN, "known hardware",
+                f"{v}:{p_} tested by {hit.get('tested_by')} — works: "
+                f"{hit.get('works')}", note)
+        else:
+            add(INFO, "known hardware", f"{v}:{p_} has not been tested by anyone",
+                "That is expected -- this plugin has been run against one "
+                "digitizer. If it works for you, adding an entry to "
+                "hardware.json is the most useful thing you can contribute. If "
+                "it does not, that is worth recording too.")
+
+
+def check_pen(add, ifaces):
+    """A pen digitizer also sets INPUT_PROP_DIRECT, and is not a touchscreen.
+
+    Picking the stylus surface instead of the finger surface gives a device
+    that reports nothing when you touch it, which looks exactly like a broken
+    touchscreen.
+    """
+    for d in ifaces:
+        name = (d.get("name") or "").lower()
+        if any(w in name for w in ("pen", "stylus", "wacom", "digitizer pen")):
+            add(WARN, "pen vs touch",
+                f"{d.get('name')} looks like a PEN surface",
+                "A stylus digitizer also sets INPUT_PROP_DIRECT but reports "
+                "nothing for a finger. If touch does not register, name the "
+                "finger device explicitly in the panel.")
+            return
+    if ifaces:
+        add(OK, "pen vs touch", "no stylus-only surface picked")
+
+
+def check_hyprland_sees_it(add, ifaces):
+    devs = hypr(["devices"])
+    if devs is None:
+        add(INFO, "compositor", "hyprctl did not answer",
+            "Not fatal for the reader, which talks to /dev/input directly, but "
+            "the compositor is what actually moves the cursor.")
+        return None
+    touch = devs.get("touch") or []
+    if not touch:
+        add(BAD, "compositor", "Hyprland reports no touch devices",
+            "The kernel sees your digitizer but libinput does not. Usually a "
+            "missing or excluded libinput quirk. `sudo libinput list-devices` "
+            "is the next place to look.")
+        return touch
+    for t in touch:
+        add(OK, "compositor", f"Hyprland sees {t.get('name')}")
+    return touch
+
+
+def check_output_binding(add, touch, mons):
+    """The classic multi-monitor failure.
+
+    With more than one output and no binding, a touch is spread across the
+    WHOLE desktop: touching the left edge of a laptop panel lands somewhere in
+    the middle of the external monitor. It reads as "touch is wildly offset"
+    rather than as a configuration gap, and it is the single most common
+    complaint about touchscreens on any compositor.
+    """
+    if not mons:
+        return
+    if len(mons) < 2:
+        add(OK, "output binding", "single monitor, nothing to bind")
+        return
+    bound = [t for t in (touch or []) if (t.get("output") or "").strip()
+             not in ("", "[[Auto]]", "auto")]
+    if bound:
+        for t in bound:
+            add(OK, "output binding", f"{t.get('name')} -> {t.get('output')}")
+        return
+    names = ", ".join(m.get("name", "?") for m in mons)
+    add(BAD, "output binding",
+        f"{len(mons)} monitors ({names}) and the touchscreen is bound to none",
+        "Touch will be spread across the whole desktop, so it lands in the "
+        "wrong place. Set the output in the omatouch panel, or in Hyprland: "
+        "device { name = <touch device>; output = <monitor> }")
+
+
+def check_geometry(add, ifaces, mons):
+    """Does the digitizer's shape match the screen it is supposed to be?
+
+    A digitizer reports its own coordinate range. If that aspect ratio does not
+    match the monitor's, the mapping is wrong -- usually because touch is bound
+    to the wrong output, or to none. This catches the offset case ARITHMETICALLY
+    rather than waiting for somebody to notice their finger is an inch from the
+    cursor.
+    """
+    if not ifaces or not mons:
+        return
+    d = ifaces[0]
+    ax = (d.get("axes") or {})
+    x, y = ax.get("x"), ax.get("y")
+    if not x or not y or not x[1] or not y[1]:
+        add(INFO, "geometry", "the digitizer does not report a coordinate range")
+        return
+    touch_ratio = x[1] / y[1]
+    best = None
+    for m in mons:
+        w, h = m.get("width"), m.get("height")
+        if not w or not h:
+            continue
+        # A rotated monitor reports its rotated size; compare both ways.
+        for ratio, how in ((w / h, ""), (h / w, " (rotated)")):
+            diff = abs(ratio - touch_ratio) / touch_ratio
+            if best is None or diff < best[0]:
+                best = (diff, m.get("name"), how)
+    if best is None:
+        return
+    diff, name, how = best
+    if diff < 0.03:
+        add(OK, "geometry",
+            f"digitizer {x[1]}x{y[1]} matches {name}{how} within {diff*100:.1f}%")
+    else:
+        add(WARN, "geometry",
+            f"digitizer aspect {touch_ratio:.3f} is {diff*100:.0f}% off the "
+            f"closest monitor ({name}{how})",
+            "Touch may land offset from where you press. Usually the wrong "
+            "output binding, or a panel whose transform does not match the "
+            "monitor's.")
+
+
+def check_transform(add, mons, settings):
+    if not mons:
+        return
+    mon = next((m for m in mons if m.get("focused")), mons[0])
+    mt = mon.get("transform", 0) or 0
+    st = int(settings.get("transform", 0) or 0)
+    if mt == st:
+        add(OK, "rotation", f"{mon.get('name')} transform {mt} matches the setting")
+    else:
+        add(WARN, "rotation",
+            f"{mon.get('name')} is at transform {mt}, omatouch is set to {st}",
+            "Touch axes will be rotated relative to the picture: dragging up "
+            "moves things sideways. Match them, or turn on auto-rotate.")
+
+
+def check_accelerometer(add):
+    found = glob.glob("/sys/bus/iio/devices/iio:device*/in_accel_x_raw")
+    if found:
+        add(OK, "accelerometer", f"present ({len(found)} device)")
+    else:
+        add(INFO, "accelerometer", "none fitted",
+            "Auto-rotate and automatic tablet mode cannot work without one. "
+            "Everything else is unaffected.")
+
+
+def plugin_id():
+    """The install directory name, from the manifest -- never assumed.
+
+    install.sh derives it from manifest.json's `id`, which is
+    "prezziej.touchscreen" and not the name of this checkout. The first
+    version of this check hardcoded the directory name and reported a healthy
+    install as missing, which is precisely the class of mistake a doctor exists
+    to avoid making on somebody else's machine.
+    """
+    try:
+        with open(os.path.join(HERE, "..", "manifest.json"), encoding="utf-8") as f:
+            return json.load(f).get("id") or ""
+    except (OSError, ValueError):
+        return ""
+
+
+def check_install(add):
+    pid = plugin_id()
+    if not pid:
+        add(WARN, "installed", "manifest.json has no id, so I cannot tell "
+            "where this installs to")
+        return
+    installed = os.path.expanduser(f"~/.config/omarchy/plugins/{pid}")
+    if not os.path.isdir(installed):
+        add(WARN, "installed", f"not installed as {pid}",
+            "Run ./install.sh. Edits to this checkout do not take effect until "
+            "you do -- the installed copy is a copy, not a symlink.")
+        return
+    stale = []
+    for f in ("Service.qml", "Panel.qml", "BarWidget.qml", "Overlay.qml",
+              "Hud.qml", "scripts/touch-tap", "scripts/orientation",
+              "scripts/clamshell"):
+        a, b = os.path.join(HERE, "..", f), os.path.join(installed, f)
+        try:
+            if open(a, "rb").read() != open(b, "rb").read():
+                stale.append(f)
+        except OSError:
+            continue
+    if stale:
+        add(WARN, "installed", f"{len(stale)} file(s) differ from this checkout",
+            "Run ./install.sh and restart the shell: " + ", ".join(stale))
+    else:
+        add(OK, "installed", f"{pid} matches this checkout")
+
+
+def settings():
+    p = os.path.expanduser("~/.config/omarchy/omatouch.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="omatouch doctor")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable, for a bug report")
+    args = ap.parse_args(argv)
+
+    findings = []
+
+    def add(level, area, detail, advice=""):
+        findings.append({"level": level, "area": area, "detail": detail,
+                         "advice": advice})
+
+    state, _ = reader_state()
+    mons = hypr(["monitors"]) or []
+    cfg = settings()
+
+    check_group(add)
+    ifaces = check_devices(add, state)
+    check_known(add, ifaces)
+    check_pen(add, ifaces)
+    touch = check_hyprland_sees_it(add, ifaces)
+    check_output_binding(add, touch, mons)
+    check_geometry(add, ifaces, mons)
+    check_transform(add, mons, cfg)
+    check_accelerometer(add)
+    check_install(add)
+
+    if args.json:
+        print(json.dumps({"findings": findings,
+                          "interfaces": ifaces,
+                          "monitors": mons,
+                          "settings": cfg}, indent=2))
+        return 0
+
+    print(f"\n  {BOLD}omatouch doctor{RESET}\n")
+    for f in findings:
+        t = TONE[f["level"]]
+        print(f"  {t}{MARK[f['level']]}{RESET}  {f['area']:<16} {f['detail']}")
+        if f["advice"]:
+            for line in _wrap(f["advice"], 66):
+                print(f"        {DIM}{line}{RESET}")
+    bad = sum(1 for f in findings if f["level"] == BAD)
+    warn = sum(1 for f in findings if f["level"] == WARN)
+    print()
+    if bad:
+        print(f"  {TONE[BAD]}{bad} problem(s){RESET}"
+              + (f", {warn} worth checking" if warn else ""))
+    elif warn:
+        print(f"  {TONE[WARN]}nothing broken, {warn} worth checking{RESET}")
+    else:
+        print(f"  {TONE[OK]}all good{RESET}")
+    print(f"\n  {DIM}Reporting a problem? Send the output of:"
+          f" ./scripts/doctor --json{RESET}\n")
+    return 1 if bad else 0
+
+
+def _wrap(text, width):
+    words, line, out = text.split(), "", []
+    for w in words:
+        if len(line) + len(w) + 1 > width:
+            out.append(line)
+            line = w
+        else:
+            line = (line + " " + w).strip()
+    if line:
+        out.append(line)
+    return out
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

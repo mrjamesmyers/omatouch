@@ -1,0 +1,48 @@
+{
+  "_readme": [
+    "Digitizers omatouch has actually been run against.",
+    "",
+    "WHY THIS FILE EXISTS.",
+    "",
+    "The plugin was written against exactly one touchscreen. Everything here",
+    "generalises in principle -- it reads evdev, which is the same everywhere --",
+    "but 'in principle' is how plugins come to not work on hardware their author",
+    "never had. A vendor that reports pressure differently, a panel whose axes",
+    "are inverted, a digitizer that needs a libinput quirk: none of that shows",
+    "up until somebody with that hardware tries it.",
+    "",
+    "`scripts/doctor` reads this and tells you whether your digitizer is known.",
+    "An unknown one is not a warning -- it is an invitation. Run the doctor, use",
+    "the plugin for a day, and open a pull request adding your entry with",
+    "whatever did or did not work.",
+    "",
+    "`quirks` is the useful part over time: the specific thing that had to be",
+    "done for that device, so the next person with it does not rediscover it."
+  ],
+
+  "schema": {
+    "vendor": "USB/i2c vendor id, lowercase hex, as the reader reports it",
+    "product": "product id, same",
+    "name": "the evdev name string",
+    "machine": "the laptop or monitor it was found in",
+    "slots": "how many simultaneous contacts it reports",
+    "works": "yes | partial | no",
+    "quirks": "anything that had to be done to make it work",
+    "tested_by": "who ran it",
+    "tested_on": "YYYY-MM-DD"
+  },
+
+  "digitizers": [
+    {
+      "vendor": "06cb",
+      "product": "16d6",
+      "name": "SYNA7501:00 06CB:16D6",
+      "machine": "Lenovo Yoga 710-15IKB (2017 convertible)",
+      "slots": 10,
+      "works": "yes",
+      "quirks": "None. Reports 10 contacts over i2c, axes match the panel to within 0.4%, and the accelerometer supports auto-rotate and tablet mode.",
+      "tested_by": "mrjamesmyers",
+      "tested_on": "2026-09-02"
+    }
+  ]
+}
